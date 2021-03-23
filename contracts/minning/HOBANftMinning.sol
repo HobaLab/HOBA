@@ -3,6 +3,7 @@ pragma solidity 0.7.3;
 pragma experimental ABIEncoderV2;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/utils/EnumerableSet.sol";
@@ -10,7 +11,7 @@ import "@openzeppelin/contracts/utils/EnumerableSet.sol";
 import "../ReentrancyGuard.sol";
 import "../IHOBANft.sol";
 
-contract HOBANftMinning is ReentrancyGuard, Ownable {
+contract HOBANftMinning is ReentrancyGuard, IERC721Receiver, Ownable {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
     using Address for address;
@@ -41,6 +42,7 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
     // Info of each pool.
     struct PoolInfo {
         IERC20 token;               // Address of token contract.
+        uint256 amount;             // Balance of token.
         bool withNft;               // Whether require nft.
         uint256 allocPoint;         // How many allocation points assigned to this pool. Token to distribute per block.
         uint256 lastRewardBlock;    // Last block number that distribution occurs.
@@ -91,8 +93,32 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
         tokenPerBlock = _tokenPerBlock;
     }
 
-    function poolLength() external view returns (uint256) {
-        return poolInfo.length;
+    function onERC721Received(address, address, uint256, bytes memory) public virtual override returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    function userNftCount(address _user, uint256 _pid) public view returns (uint256) {
+        return userInfo[_pid][_user].nftIds.length();
+    }
+
+    function userNftByIndex(address _user, uint256 _pid, uint256 _idx) public view returns (uint256) {
+        return userInfo[_pid][_user].nftIds.at(_idx);
+    }
+
+    function userAccPoint(address _user, uint256 _pid) public view returns (uint256) {
+        return userInfo[_pid][_user].accPoint;
+    }
+
+    function userAmount(address _user, uint256 _pid) public view returns (uint256) {
+        return userInfo[_pid][_user].amount;
+    }
+
+    function userWithNft(address _user, uint256 _pid) public view returns (bool) {
+        return userInfo[_pid][_user].withNft;
+    }
+
+    function userRewardDebt(address _user, uint256 _pid) public view returns (uint256) {
+        return userInfo[_pid][_user].rewardDebt;
     }
 
     // Add a new lp to the pool. Can only be called by the owner.
@@ -104,8 +130,9 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
         uint256 lastRewardBlock = block.number > bonusBeginBlock? block.number : bonusBeginBlock;
         totalAllocPoint = totalAllocPoint.add(_allocPoint);
         poolInfo.push(PoolInfo({
-            withNft: _withNft,
             token: _token,
+            amount: 0,
+            withNft: _withNft,
             allocPoint: _allocPoint,
             lastRewardBlock: lastRewardBlock,
             accPerShare: 0
@@ -147,13 +174,14 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accPerShare = pool.accPerShare;
-        uint256 tokenSupply = pool.token.balanceOf(address(this));
+        uint256 tokenSupply = pool.amount;
         if (block.number > pool.lastRewardBlock && tokenSupply != 0) {
             uint256 reward = getReward(pool.lastRewardBlock, block.number);
             uint256 poolReward = reward.mul(pool.allocPoint).div(totalAllocPoint);
             accPerShare = accPerShare.add(poolReward.mul(1e12).div(tokenSupply));
         }
-        return user.amount.mul(accPerShare).div(1e12).sub(user.rewardDebt).mul(user.accPoint).div(NFT_FACTOR);
+        uint256 pending = user.amount.mul(accPerShare).div(1e12).sub(user.rewardDebt);
+        return pending.add(pending.mul(user.accPoint).div(NFT_FACTOR));
     }
 
     // Update reward variables for all pools. Be careful of gas spending!
@@ -170,7 +198,7 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
         if (block.number <= pool.lastRewardBlock) {
             return;
         }
-        uint256 tokenSupply = pool.token.balanceOf(address(this));
+        uint256 tokenSupply = pool.amount;
         if (tokenSupply == 0) {
             pool.lastRewardBlock = block.number;
             return;
@@ -208,13 +236,14 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
             uint256 pending = user.amount.mul(pool.accPerShare).div(1e12).sub(user.rewardDebt);
             if(pending > 0) {
                 // calculate nft stake acc
-                pending = pending.mul(user.accPoint).div(NFT_FACTOR);
+                pending = pending.add(pending.mul(user.accPoint).div(NFT_FACTOR));
                 safeTokenTransfer(msg.sender, pending);
             }
         }
 
         if(_amount > 0) {
             pool.token.safeTransferFrom(address(msg.sender), address(this), _amount);
+            pool.amount = pool.amount.add(_amount);
             user.amount = user.amount.add(_amount);
         }
 
@@ -232,7 +261,7 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
         uint256 pending = user.amount.mul(pool.accPerShare).div(1e12).sub(user.rewardDebt);
         if (pending > 0) {
             // calculate nft stake acc
-            pending = pending.mul(user.accPoint).div(NFT_FACTOR);
+            pending = pending.add(pending.mul(user.accPoint).div(NFT_FACTOR));
             safeTokenTransfer(msg.sender, pending);
         }
 
@@ -244,13 +273,17 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
                 user.accPoint = 0;
                 user.withNft = false;
 
-                for(uint256 i = 0; i < user.nftIds.length(); i++) {
-                    uint256 nftId = user.nftIds.at(i);
+                uint256 len = user.nftIds.length();
+                for(uint256 i = 0; i < len; i++) {
+                    uint256 nftId = user.nftIds.at(0);
+                    user.nftIds.remove(nftId);
+
                     nftIds[i] = nftId;
                     hobaNft.safeTransferFrom(address(this), _msgSender(), nftId);
                 }
             }
             user.amount = user.amount.sub(_amount);
+            pool.amount = pool.amount.sub(_amount);
             pool.token.safeTransfer(address(_msgSender()), _amount);
         }
 
@@ -263,12 +296,16 @@ contract HOBANftMinning is ReentrancyGuard, Ownable {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
 
+        pool.amount = pool.amount.sub(user.amount);
         pool.token.safeTransfer(address(msg.sender), user.amount);
 
         uint256[] memory nftIds = new uint256[](user.nftIds.length());
         if(user.withNft) {
-            for(uint256 i = 0; i < user.nftIds.length(); i++) {
-                uint256 nftId = user.nftIds.at(i);
+            uint256 len = user.nftIds.length();
+            for(uint256 i = 0; i < len; i++) {
+                uint256 nftId = user.nftIds.at(0);
+                user.nftIds.remove(nftId);
+
                 nftIds[i] = nftId;
                 hobaNft.safeTransferFrom(address(this), _msgSender(), nftId);
             }
